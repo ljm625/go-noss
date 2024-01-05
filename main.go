@@ -15,7 +15,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	"github.com/nbd-wtf/go-nostr"
@@ -31,6 +30,7 @@ var hash string
 var messageId string
 var currentWorkers int32
 var arbRpcUrl string
+var arbWssUrl string
 
 var (
 	ErrDifficultyTooLow = errors.New("nip13: insufficient difficulty")
@@ -46,7 +46,8 @@ func init() {
 	sk = os.Getenv("sk")
 	pk = os.Getenv("pk")
 	numberOfWorkers, _ = strconv.Atoi(os.Getenv("numberOfWorkers"))
-	arbRpcUrl = os.Getenv("arbRpcUrl")
+	// arbRpcUrl = os.Getenv("arbRpcUrl")
+	arbWssUrl = os.Getenv("arbWssUrl")
 }
 
 func generateRandomString(length int) (string, error) {
@@ -88,7 +89,18 @@ func Generate(event nostr.Event, targetDifficulty int) (nostr.Event, error) {
 type Message struct {
 	EventId string `json:"eventId"`
 }
+type BlockResult struct {
+	Number  string `json:"number"`
+	Hash    string `json:"hash"`
+}
 
+type BlockParams struct {
+	Result BlockResult `json:"result"`
+}
+
+type BlockMessage struct {
+	Params BlockParams `json:"params"`
+}
 type EV struct {
 	Sig       string          `json:"sig"`
 	Id        string          `json:"id"`
@@ -99,7 +111,7 @@ type EV struct {
 	PubKey    string          `json:"pubkey"`
 }
 
-func mine(ctx context.Context, messageId string, client *ethclient.Client) {
+func mine(ctx context.Context, messageId string) {
 
 	replayUrl := "wss://relay.noscription.org/"
 	difficulty := 21
@@ -189,22 +201,46 @@ func mine(ctx context.Context, messageId string, client *ethclient.Client) {
         req.Header.Set("Sec-fetch-site", "same-site")
 
 		// 发送请求
+		sendTime := time.Now()
 		client := &http.Client{}
 		resp, err := client.Do(req)
 		if err != nil {
 			log.Fatalf("Error sending request: %v", err)
 		}
 		defer resp.Body.Close()
-
 		fmt.Println("Response Status:", resp.Status)
 		spendTime := time.Since(startTime)
+		spendTimeNetwork := time.Since(sendTime)
+
 		// fmt.Println("Response Body:", string(body))
-		fmt.Println(nostr.Now().Time(), "spend: ", spendTime, "!!!!!!!!!!!!!!!!!!!!!published to:", evNew.ID)
+		fmt.Println(nostr.Now().Time(), "spend: ", spendTime, "network: ", spendTimeNetwork, "!!!!!!!!!!!!!!!!!!!!!published to:", evNew.ID)
 		atomic.StoreInt32(&nonceFound, 0)
 	case <-ctx.Done():
 		fmt.Print("done")
 	}
 
+}
+func connectToEthWSS(url string) (*websocket.Conn, error){
+	var conn *websocket.Conn
+	var err error
+	var msg string
+	headers := http.Header{}
+	msg = "{\"jsonrpc\":\"2.0\",\"id\": 2, \"method\": \"eth_subscribe\", \"params\": [\"newHeads\"]}"
+	for {
+		// 使用gorilla/websocket库建立连接
+		conn, _, err = websocket.DefaultDialer.Dial(url,headers)
+		fmt.Println("Connecting to ETH wss")
+		if err != nil {
+			// 连接失败，打印错误并等待一段时间后重试
+			fmt.Println("Error connecting to WebSocket:", err)
+			// time.Sleep(1 * time.Second) // 5秒重试间隔
+			continue
+		}
+		// 连接成功，退出循环
+		break
+	}
+	err = conn.WriteMessage(websocket.TextMessage,[]byte(msg))
+	return conn, err
 }
 
 func connectToWSS(url string) (*websocket.Conn, error) {
@@ -238,32 +274,39 @@ func main() {
 
 	var err error
 
-	client, err := ethclient.Dial(arbRpcUrl)
-	if err != nil {
-		log.Fatalf("无法连接到Arbitrum节点: %v", err)
-	}
+	// client, err := ethclient.Dial(arbRpcUrl)
+	// if err != nil {
+	// 	log.Fatalf("无法连接到Arbitrum节点: %v", err)
+	// }
 
 	c, err := connectToWSS(wssAddr)
+	
 	if err != nil {
 		panic(err)
 	}
 	defer c.Close()
+	ethc, err := connectToEthWSS(arbWssUrl)
+	
+	if err != nil {
+		panic(err)
+	}
+	defer ethc.Close()
 
 	// initialize an empty cancel function
 
 	// get block
-	go func() {
-		for {
-			header, err := client.HeaderByNumber(context.Background(), nil)
-			if err != nil {
-				log.Fatalf("无法获取最新区块号: %v", err)
-			}
-			if header.Number.Uint64() >= blockNumber {
-				hash = header.Hash().Hex()
-				blockNumber = header.Number.Uint64()
-			}
-		}
-	}()
+	// go func() {
+	// 	for {
+	// 		header, err := client.HeaderByNumber(context.Background(), nil)
+	// 		if err != nil {
+	// 			log.Fatalf("无法获取最新区块号: %v", err)
+	// 		}
+	// 		if header.Number.Uint64() >= blockNumber {
+	// 			hash = header.Hash().Hex()
+	// 			blockNumber = header.Number.Uint64()
+	// 		}
+	// 	}
+	// }()
 
 	go func() {
 		for {
@@ -283,6 +326,36 @@ func main() {
 
 	}()
 
+	go func() {
+		for {
+			_, message, err := ethc.ReadMessage()
+			if err != nil {
+				log.Println("read:", err)
+				break
+			}
+
+			var messageDecode BlockMessage
+			if err := json.Unmarshal(message, &messageDecode); err != nil {
+				fmt.Println(err)
+				continue
+			}
+			number, err := strconv.ParseUint(messageDecode.Params.Result.Number, 0, 64)
+			if err != nil {
+				fmt.Println("err:", err)
+				continue
+			}
+			fmt.Println(number)
+
+			if number >= blockNumber {
+				hash = messageDecode.Params.Result.Hash
+				blockNumber = number
+			}
+
+		}
+
+	}()
+
+
 	atomic.StoreInt32(&currentWorkers, 0)
 	// 初始化一个取消上下文和它的取消函数
 	ctx, cancel := context.WithCancel(context.Background())
@@ -299,7 +372,7 @@ func main() {
 					atomic.AddInt32(&currentWorkers, 1) // 增加工作者数量
 					go func(bn uint64, mid string) {
 						defer atomic.AddInt32(&currentWorkers, -1) // 完成后减少工作者数量
-						mine(ctx, mid, client)
+						mine(ctx, mid)
 					}(blockNumber, messageId)
 				}
 			}
